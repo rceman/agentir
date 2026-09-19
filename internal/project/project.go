@@ -7,7 +7,6 @@ import (
 	"go/parser"
 	"go/printer"
 	"go/token"
-	"hash/fnv"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,7 +15,7 @@ import (
 	"github.com/rceman/agentir/internal/source"
 )
 
-// Projection contains the public document plus exact expression spans used by the patcher.
+// Projection contains the public document plus exact projected-node spans used by the patcher.
 type Projection struct {
 	Document ir.Document
 	Nodes    map[string]ir.Span
@@ -31,12 +30,12 @@ func Project(path string, data []byte) (Projection, error) {
 	}
 
 	p := &projector{
-		path:  filepath.ToSlash(filepath.Clean(path)),
-		data:  data,
-		fset:  fset,
-		nodes: make(map[string]ir.Span),
+		path:    filepath.ToSlash(filepath.Clean(path)),
+		data:    data,
+		fset:    fset,
+		nodes:   make(map[string]ir.Span),
+		nodeIDs: make(map[ast.Node]string),
 	}
-	p.indexNodes(file)
 
 	doc := ir.Document{
 		Version:  ir.Version,
@@ -65,21 +64,12 @@ func Project(path string, data []byte) (Projection, error) {
 }
 
 type projector struct {
-	path  string
-	data  []byte
-	fset  *token.FileSet
-	nodes map[string]ir.Span
-}
-
-func (p *projector) indexNodes(file *ast.File) {
-	ast.Inspect(file, func(n ast.Node) bool {
-		if n == nil {
-			return true
-		}
-		span := p.span(n.Pos(), n.End())
-		p.nodes[p.nodeID(n, span)] = span
-		return true
-	})
+	path     string
+	data     []byte
+	fset     *token.FileSet
+	nodes    map[string]ir.Span
+	nodeIDs  map[ast.Node]string
+	nextNode int
 }
 
 func (p *projector) span(start, end token.Pos) ir.Span {
@@ -96,9 +86,14 @@ func (p *projector) span(start, end token.Pos) ir.Span {
 }
 
 func (p *projector) nodeID(n ast.Node, span ir.Span) string {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(fmt.Sprintf("%T:%d:%d", n, span.StartOffset, span.EndOffset)))
-	return fmt.Sprintf("n_%016x", h.Sum64())
+	if id, ok := p.nodeIDs[n]; ok {
+		return id
+	}
+	p.nextNode++
+	id := "n" + strconv.Itoa(p.nextNode)
+	p.nodeIDs[n] = id
+	p.nodes[id] = span
+	return id
 }
 
 func (p *projector) render(n ast.Node) string {
