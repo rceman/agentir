@@ -47,7 +47,7 @@ $t2 = call filterUsers($t1)
 users := $t2
 ```
 
-Every projected node has a deterministic node ID derived from its AST node kind and exact source span. The projection also includes the source SHA-256. Patches must target known node IDs and the exact source hash they were generated from, so stale projections fail closed.
+Every projected node gets a deterministic snapshot-local ID (for example `n7`) in projection order. IDs only need to be stable for that exact source snapshot because the projection also includes the source SHA-256. Patches must target known node IDs and the exact source hash they were generated from, so stale projections fail closed.
 
 ## Try it
 
@@ -55,7 +55,7 @@ Every projected node has a deterministic node ID derived from its AST node kind 
 go run ./cmd/agentir project ./fixtures/nested.go
 ```
 
-The default output is a compact, line-oriented agent view. Use JSON when a machine-readable projection is more useful:
+The default output is a compact, line-oriented agent view. It deliberately omits byte/line spans because the node ID is sufficient for patch targeting. JSON retains the full source map when a machine-readable projection is useful:
 
 ```bash
 go run ./cmd/agentir project --format json ./fixtures/nested.go
@@ -76,7 +76,7 @@ A patch document has this shape:
   "source_sha256": "<sha256 from projection>",
   "edits": [
     {
-      "node_id": "n_0123456789abcdef",
+      "node_id": "n7",
       "replacement": "normalizeName(name)"
     }
   ]
