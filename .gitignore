@@ -1,0 +1,4 @@
+/agentir
+*.out
+*.test
+.DS_Store
