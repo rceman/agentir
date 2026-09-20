@@ -1,18 +1,14 @@
 package ir
 
-// Version identifies the current experimental projection format.
 const Version = "agentir/v0"
-
-// PatchVersion identifies the current experimental patch format.
 const PatchVersion = "agentir/patch-v0"
+const IRPatchVersion = "agentir/irpatch-v0"
 
-// SourceRef identifies the source file projected into AgentIR.
 type SourceRef struct {
 	Path   string `json:"path"`
 	SHA256 string `json:"sha256"`
 }
 
-// Span is a half-open byte range [StartOffset, EndOffset) plus human-readable positions.
 type Span struct {
 	StartOffset int `json:"start_offset"`
 	EndOffset   int `json:"end_offset"`
@@ -22,9 +18,10 @@ type Span struct {
 	EndColumn   int `json:"end_column"`
 }
 
-// Op is one explicit operation in the agent-facing projection.
+// Op is one operation in the agent-facing projection. ID is empty for structural
+// rows that are useful for reasoning but intentionally cannot be patched directly.
 type Op struct {
-	ID     string `json:"id"`
+	ID     string `json:"id,omitempty"`
 	Kind   string `json:"kind"`
 	Result string `json:"result,omitempty"`
 	Text   string `json:"text"`
@@ -32,14 +29,13 @@ type Op struct {
 	Source Span   `json:"source"`
 }
 
-// Function contains the projected operations for one Go function or method.
 type Function struct {
-	Name   string `json:"name"`
-	Source Span   `json:"source"`
-	Ops    []Op   `json:"ops"`
+	Name      string `json:"name"`
+	Signature string `json:"signature"`
+	Source    Span   `json:"source"`
+	Ops       []Op   `json:"ops"`
 }
 
-// Document is the complete AgentIR projection for one source file.
 type Document struct {
 	Version   string     `json:"version"`
 	Language  string     `json:"language"`
@@ -47,15 +43,27 @@ type Document struct {
 	Functions []Function `json:"functions"`
 }
 
-// Patch is a guarded set of source replacements addressed by AgentIR node IDs.
+// Patch is the raw-source baseline. Replacement contains Go source.
 type Patch struct {
 	Version      string `json:"version"`
 	SourceSHA256 string `json:"source_sha256"`
 	Edits        []Edit `json:"edits"`
 }
 
-// Edit replaces the exact source span corresponding to NodeID.
 type Edit struct {
 	NodeID      string `json:"node_id"`
 	Replacement string `json:"replacement"`
+}
+
+// IRPatch edits the AgentIR text of an addressable operation. Temporary values
+// such as $3 are expanded back to the exact source expression they represent.
+type IRPatch struct {
+	Version      string   `json:"version"`
+	SourceSHA256 string   `json:"source_sha256"`
+	Edits        []IREdit `json:"edits"`
+}
+
+type IREdit struct {
+	NodeID string `json:"node_id"`
+	Text   string `json:"text"`
 }

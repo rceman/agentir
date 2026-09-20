@@ -15,13 +15,20 @@ import (
 	"github.com/rceman/agentir/internal/source"
 )
 
-// Projection contains the public document plus exact projected-node spans used by the patcher.
-type Projection struct {
-	Document ir.Document
-	Nodes    map[string]ir.Span
+type Node struct {
+	Span   ir.Span
+	Kind   string
+	Result string
 }
 
-// Project parses Go source and emits a deterministic, linearized AgentIR view.
+// Projection contains the public AgentIR document plus exact patch metadata.
+type Projection struct {
+	Document ir.Document
+	Nodes    map[string]Node
+	Temps    map[string]ir.Span
+}
+
+// Project parses Go source and emits a deterministic AgentIR view.
 func Project(path string, data []byte) (Projection, error) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, path, data, parser.ParseComments)
@@ -33,7 +40,8 @@ func Project(path string, data []byte) (Projection, error) {
 		path:    filepath.ToSlash(filepath.Clean(path)),
 		data:    data,
 		fset:    fset,
-		nodes:   make(map[string]ir.Span),
+		nodes:   make(map[string]Node),
+		temps:   make(map[string]ir.Span),
 		nodeIDs: make(map[ast.Node]string),
 	}
 
@@ -51,23 +59,28 @@ func Project(path string, data []byte) (Projection, error) {
 		if !ok || fn.Body == nil {
 			continue
 		}
-		fp := &functionProjector{projector: p}
+		fp := &functionProjector{
+			projector: p,
+			comments:  commentsInside(file.Comments, fn.Body),
+		}
 		fp.projectBlock(fn.Body, 0)
 		doc.Functions = append(doc.Functions, ir.Function{
-			Name:   functionName(fn),
-			Source: p.span(fn.Pos(), fn.End()),
-			Ops:    fp.ops,
+			Name:      functionName(fn),
+			Signature: p.functionSignature(fn),
+			Source:    p.span(fn.Pos(), fn.End()),
+			Ops:       fp.ops,
 		})
 	}
 
-	return Projection{Document: doc, Nodes: p.nodes}, nil
+	return Projection{Document: doc, Nodes: p.nodes, Temps: p.temps}, nil
 }
 
 type projector struct {
 	path     string
 	data     []byte
 	fset     *token.FileSet
-	nodes    map[string]ir.Span
+	nodes    map[string]Node
+	temps    map[string]ir.Span
 	nodeIDs  map[ast.Node]string
 	nextNode int
 }
@@ -85,14 +98,17 @@ func (p *projector) span(start, end token.Pos) ir.Span {
 	}
 }
 
-func (p *projector) nodeID(n ast.Node, span ir.Span) string {
+func (p *projector) nodeID(n ast.Node, span ir.Span, kind, result string) string {
 	if id, ok := p.nodeIDs[n]; ok {
 		return id
 	}
 	p.nextNode++
 	id := "n" + strconv.Itoa(p.nextNode)
 	p.nodeIDs[n] = id
-	p.nodes[id] = span
+	p.nodes[id] = Node{Span: span, Kind: kind, Result: result}
+	if result != "" {
+		p.temps[result] = span
+	}
 	return id
 }
 
@@ -102,6 +118,19 @@ func (p *projector) render(n ast.Node) string {
 		return "<unprintable>"
 	}
 	return b.String()
+}
+
+func (p *projector) functionSignature(fn *ast.FuncDecl) string {
+	copyFn := *fn
+	copyFn.Doc = nil
+	copyFn.Body = nil
+	var b bytes.Buffer
+	if err := printer.Fprint(&b, p.fset, &copyFn); err != nil {
+		return functionName(fn)
+	}
+	s := strings.TrimSpace(b.String())
+	s = strings.TrimPrefix(s, "func ")
+	return s
 }
 
 func functionName(fn *ast.FuncDecl) string {
@@ -126,15 +155,49 @@ func receiverName(expr ast.Expr) string {
 	}
 }
 
+func commentsInside(all []*ast.CommentGroup, body *ast.BlockStmt) []*ast.CommentGroup {
+	var out []*ast.CommentGroup
+	for _, group := range all {
+		if group.Pos() > body.Lbrace && group.End() < body.Rbrace {
+			out = append(out, group)
+		}
+	}
+	return out
+}
+
 type functionProjector struct {
-	projector *projector
-	ops       []ir.Op
-	temp      int
+	projector   *projector
+	ops         []ir.Op
+	temp        int
+	comments    []*ast.CommentGroup
+	commentNext int
 }
 
 func (f *functionProjector) projectBlock(block *ast.BlockStmt, depth int) {
 	for _, stmt := range block.List {
+		f.emitCommentsBefore(stmt.Pos(), depth)
 		f.projectStmt(stmt, depth)
+	}
+	f.emitCommentsBefore(block.Rbrace, depth)
+}
+
+func (f *functionProjector) emitCommentsBefore(limit token.Pos, depth int) {
+	for f.commentNext < len(f.comments) && f.comments[f.commentNext].Pos() < limit {
+		group := f.comments[f.commentNext]
+		span := f.projector.span(group.Pos(), group.End())
+		text := strings.TrimSpace(group.Text())
+		if text == "" {
+			text = "//"
+		} else {
+			lines := strings.Split(text, "
+")
+			for i := range lines {
+				lines[i] = "// " + strings.TrimSpace(lines[i])
+			}
+			text = strings.Join(lines, " | ")
+		}
+		f.ops = append(f.ops, ir.Op{Kind: "comment", Text: text, Depth: depth, Source: span})
+		f.commentNext++
 	}
 }
 
@@ -143,43 +206,41 @@ func (f *functionProjector) projectStmt(stmt ast.Stmt, depth int) {
 	case *ast.AssignStmt:
 		values := make([]string, 0, len(s.Rhs))
 		for _, rhs := range s.Rhs {
-			values = append(values, f.projectExpr(rhs, depth))
+			values = append(values, f.projectExpr(rhs, depth, false))
 		}
 		lhs := make([]string, 0, len(s.Lhs))
 		for _, item := range s.Lhs {
 			lhs = append(lhs, f.projector.render(item))
 		}
-		f.emitNode(s, "assign", "", strings.Join(lhs, ", ")+" "+s.Tok.String()+" "+strings.Join(values, ", "), depth)
+		f.emitPatchable(s, "assign", "", strings.Join(lhs, ", ")+" "+s.Tok.String()+" "+strings.Join(values, ", "), depth)
 
 	case *ast.DeclStmt:
-		f.emitNode(s, "decl", "", f.projector.render(s), depth)
+		f.emitPatchable(s, "decl", "", f.projector.render(s), depth)
 
 	case *ast.ExprStmt:
-		value := f.projectExpr(s.X, depth)
-		if _, ok := s.X.(*ast.CallExpr); !ok {
-			f.emitNode(s, "expr", "", value, depth)
-		}
+		value := f.projectExpr(s.X, depth, false)
+		f.emitPatchable(s, "expr", "", value, depth)
 
 	case *ast.ReturnStmt:
 		values := make([]string, 0, len(s.Results))
 		for _, result := range s.Results {
-			values = append(values, f.projectExpr(result, depth))
+			values = append(values, f.projectExpr(result, depth, false))
 		}
 		text := "return"
 		if len(values) > 0 {
 			text += " " + strings.Join(values, ", ")
 		}
-		f.emitNode(s, "return", "", text, depth)
+		f.emitPatchable(s, "return", "", text, depth)
 
 	case *ast.IfStmt:
 		if s.Init != nil {
 			f.projectStmt(s.Init, depth)
 		}
-		condition := f.projectExpr(s.Cond, depth)
-		f.emitNode(s, "if", "", "if "+condition, depth)
+		condition := f.projectExpr(s.Cond, depth, false)
+		f.emitStructural(s, "if", "if "+condition, depth)
 		f.projectBlock(s.Body, depth+1)
 		if s.Else != nil {
-			f.emitNode(s.Else, "else", "", "else", depth)
+			f.emitStructural(s.Else, "else", "else", depth)
 			switch e := s.Else.(type) {
 			case *ast.BlockStmt:
 				f.projectBlock(e, depth+1)
@@ -196,16 +257,16 @@ func (f *functionProjector) projectStmt(stmt ast.Stmt, depth int) {
 		}
 		condition := "true"
 		if s.Cond != nil {
-			condition = f.projectExpr(s.Cond, depth)
+			condition = f.projectExpr(s.Cond, depth, false)
 		}
-		f.emitNode(s, "for", "", "for "+condition, depth)
+		f.emitStructural(s, "for", "for "+condition, depth)
 		f.projectBlock(s.Body, depth+1)
 		if s.Post != nil {
 			f.projectStmt(s.Post, depth+1)
 		}
 
 	case *ast.RangeStmt:
-		rangeValue := f.projectExpr(s.X, depth)
+		rangeValue := f.projectExpr(s.X, depth, false)
 		left := ""
 		if s.Key != nil {
 			left = f.projector.render(s.Key)
@@ -214,107 +275,210 @@ func (f *functionProjector) projectStmt(stmt ast.Stmt, depth int) {
 			}
 			left += " " + s.Tok.String() + " "
 		}
-		f.emitNode(s, "range", "", "for "+left+"range "+rangeValue, depth)
+		f.emitStructural(s, "range", "for "+left+"range "+rangeValue, depth)
 		f.projectBlock(s.Body, depth+1)
 
+	case *ast.SwitchStmt:
+		if s.Init != nil {
+			f.projectStmt(s.Init, depth)
+		}
+		tag := ""
+		if s.Tag != nil {
+			tag = " " + f.projectExpr(s.Tag, depth, false)
+		}
+		f.emitStructural(s, "switch", "switch"+tag, depth)
+		for _, item := range s.Body.List {
+			clause, ok := item.(*ast.CaseClause)
+			if !ok {
+				continue
+			}
+			f.projectCaseClause(clause, depth+1)
+		}
+
+	case *ast.TypeSwitchStmt:
+		if s.Init != nil {
+			f.projectStmt(s.Init, depth)
+		}
+		assign := f.projector.render(s.Assign)
+		f.emitStructural(s, "type_switch", "switch "+assign, depth)
+		for _, item := range s.Body.List {
+			clause, ok := item.(*ast.CaseClause)
+			if !ok {
+				continue
+			}
+			f.projectCaseClause(clause, depth+1)
+		}
+
+	case *ast.SelectStmt:
+		f.emitStructural(s, "select", "select", depth)
+		for _, item := range s.Body.List {
+			clause, ok := item.(*ast.CommClause)
+			if !ok {
+				continue
+			}
+			label := "default"
+			if clause.Comm != nil {
+				label = "case " + f.projector.render(clause.Comm)
+			}
+			f.emitStructural(clause, "comm_case", label, depth+1)
+			for _, bodyStmt := range clause.Body {
+				f.projectStmt(bodyStmt, depth+2)
+			}
+		}
+
+	case *ast.LabeledStmt:
+		f.emitStructural(s, "label", s.Label.Name+":", depth)
+		f.projectStmt(s.Stmt, depth+1)
+
 	case *ast.BranchStmt:
-		f.emitNode(s, "branch", "", f.projector.render(s), depth)
+		f.emitPatchable(s, "branch", "", f.projector.render(s), depth)
 
 	case *ast.IncDecStmt:
-		f.emitNode(s, "incdec", "", f.projector.render(s), depth)
+		f.emitPatchable(s, "incdec", "", f.projector.render(s), depth)
+
+	case *ast.SendStmt:
+		f.emitPatchable(s, "send", "", f.projector.render(s), depth)
 
 	case *ast.GoStmt:
-		value := f.projectExpr(s.Call, depth)
-		f.emitNode(s, "go", "", "go "+value, depth)
+		value := f.projectExpr(s.Call, depth, false)
+		f.emitPatchable(s, "go", "", "go "+value, depth)
 
 	case *ast.DeferStmt:
-		value := f.projectExpr(s.Call, depth)
-		f.emitNode(s, "defer", "", "defer "+value, depth)
+		value := f.projectExpr(s.Call, depth, false)
+		f.emitPatchable(s, "defer", "", "defer "+value, depth)
 
 	case *ast.BlockStmt:
 		f.projectBlock(s, depth)
 
+	case *ast.EmptyStmt:
+		return
+
 	default:
-		f.emitNode(stmt, "stmt", "", f.projector.render(stmt), depth)
+		// Unsupported compound syntax remains visible but is not directly patchable.
+		f.emitStructural(stmt, "opaque", "opaque "+f.projector.render(stmt), depth)
 	}
 }
 
-func (f *functionProjector) projectExpr(expr ast.Expr, depth int) string {
+func (f *functionProjector) projectCaseClause(clause *ast.CaseClause, depth int) {
+	label := "default"
+	if len(clause.List) > 0 {
+		items := make([]string, 0, len(clause.List))
+		for _, expr := range clause.List {
+			items = append(items, f.projectExpr(expr, depth, false))
+		}
+		label = "case " + strings.Join(items, ", ")
+	}
+	f.emitStructural(clause, "case", label, depth)
+	for _, stmt := range clause.Body {
+		f.projectStmt(stmt, depth+1)
+	}
+}
+
+func (f *functionProjector) projectExpr(expr ast.Expr, depth int, materialize bool) string {
 	switch e := expr.(type) {
 	case *ast.ParenExpr:
-		return f.projectExpr(e.X, depth)
+		return f.projectExpr(e.X, depth, materialize)
 
 	case *ast.CallExpr:
 		fun := f.projectExprReference(e.Fun)
 		args := make([]string, 0, len(e.Args))
 		for _, arg := range e.Args {
-			args = append(args, f.projectExpr(arg, depth))
+			args = append(args, f.projectExpr(arg, depth, true))
+		}
+		text := fun + "(" + strings.Join(args, ", ")
+		if e.Ellipsis.IsValid() && len(args) > 0 {
+			text += "..."
+		}
+		text += ")"
+		if !materialize {
+			return text
 		}
 		result := f.nextTemp()
-		f.emitExpr(e, "call", result, "call "+fun+"("+strings.Join(args, ", ")+")", depth)
+		f.emitExpr(e, "call", result, text, depth)
 		return result
 
 	case *ast.BinaryExpr:
-		left := f.projectExpr(e.X, depth)
-		right := f.projectExpr(e.Y, depth)
+		left := f.projectExpr(e.X, depth, true)
+		right := f.projectExpr(e.Y, depth, true)
+		text := left + " " + e.Op.String() + " " + right
+		if !materialize {
+			return text
+		}
 		result := f.nextTemp()
-		f.emitExpr(e, "binary", result, left+" "+e.Op.String()+" "+right, depth)
+		f.emitExpr(e, "binary", result, text, depth)
 		return result
 
 	case *ast.UnaryExpr:
-		value := f.projectExpr(e.X, depth)
+		value := f.projectExpr(e.X, depth, true)
+		text := e.Op.String() + value
+		if !materialize {
+			return text
+		}
 		result := f.nextTemp()
-		f.emitExpr(e, "unary", result, e.Op.String()+value, depth)
+		f.emitExpr(e, "unary", result, text, depth)
 		return result
 
 	case *ast.IndexExpr:
-		target := f.projectExpr(e.X, depth)
-		index := f.projectExpr(e.Index, depth)
+		target := f.projectExpr(e.X, depth, true)
+		index := f.projectExpr(e.Index, depth, true)
+		text := target + "[" + index + "]"
+		if !materialize {
+			return text
+		}
 		result := f.nextTemp()
-		f.emitExpr(e, "index", result, target+"["+index+"]", depth)
+		f.emitExpr(e, "index", result, text, depth)
 		return result
 
 	case *ast.SliceExpr:
-		target := f.projectExpr(e.X, depth)
-		low := ""
-		high := ""
-		max := ""
+		target := f.projectExpr(e.X, depth, true)
+		low, high, max := "", "", ""
 		if e.Low != nil {
-			low = f.projectExpr(e.Low, depth)
+			low = f.projectExpr(e.Low, depth, true)
 		}
 		if e.High != nil {
-			high = f.projectExpr(e.High, depth)
+			high = f.projectExpr(e.High, depth, true)
 		}
 		if e.Max != nil {
-			max = f.projectExpr(e.Max, depth)
+			max = f.projectExpr(e.Max, depth, true)
 		}
 		inside := low + ":" + high
 		if e.Slice3 {
 			inside += ":" + max
 		}
+		text := target + "[" + inside + "]"
+		if !materialize {
+			return text
+		}
 		result := f.nextTemp()
-		f.emitExpr(e, "slice", result, target+"["+inside+"]", depth)
+		f.emitExpr(e, "slice", result, text, depth)
 		return result
 
 	case *ast.TypeAssertExpr:
-		target := f.projectExpr(e.X, depth)
-		result := f.nextTemp()
+		target := f.projectExpr(e.X, depth, true)
 		typeText := "type"
 		if e.Type != nil {
 			typeText = f.projector.render(e.Type)
 		}
-		f.emitExpr(e, "type_assert", result, target+".("+typeText+")", depth)
+		text := target + ".(" + typeText + ")"
+		if !materialize {
+			return text
+		}
+		result := f.nextTemp()
+		f.emitExpr(e, "type_assert", result, text, depth)
 		return result
 
 	case *ast.StarExpr:
-		value := f.projectExpr(e.X, depth)
+		value := f.projectExpr(e.X, depth, true)
+		text := "*" + value
+		if !materialize {
+			return text
+		}
 		result := f.nextTemp()
-		f.emitExpr(e, "deref", result, "*"+value, depth)
+		f.emitExpr(e, "deref", result, text, depth)
 		return result
 
 	case *ast.SelectorExpr:
-		// Keep selectors compact. Their receiver may itself contain work that should be expanded.
-		receiver := f.projectExpr(e.X, depth)
+		receiver := f.projectExpr(e.X, depth, true)
 		return receiver + "." + e.Sel.Name
 
 	case *ast.Ident:
@@ -323,8 +487,11 @@ func (f *functionProjector) projectExpr(expr ast.Expr, depth int) string {
 	case *ast.BasicLit:
 		return e.Value
 
+	case *ast.IndexListExpr:
+		return f.projector.render(expr)
+
 	case *ast.FuncLit, *ast.CompositeLit, *ast.KeyValueExpr, *ast.ArrayType, *ast.MapType,
-		*ast.ChanType, *ast.InterfaceType, *ast.StructType, *ast.FuncType, *ast.IndexListExpr:
+		*ast.ChanType, *ast.InterfaceType, *ast.StructType, *ast.FuncType:
 		return f.projector.render(expr)
 
 	default:
@@ -333,7 +500,6 @@ func (f *functionProjector) projectExpr(expr ast.Expr, depth int) string {
 }
 
 func (f *functionProjector) projectExprReference(expr ast.Expr) string {
-	// Function values should stay recognisable. Only expand genuinely nested computations.
 	switch e := expr.(type) {
 	case *ast.Ident:
 		return e.Name
@@ -342,35 +508,28 @@ func (f *functionProjector) projectExprReference(expr ast.Expr) string {
 	case *ast.IndexExpr, *ast.IndexListExpr:
 		return f.projector.render(expr)
 	default:
-		return f.projectExpr(expr, 0)
+		return f.projectExpr(expr, 0, true)
 	}
 }
 
 func (f *functionProjector) nextTemp() string {
 	f.temp++
-	return "$t" + strconv.Itoa(f.temp)
+	return "$" + strconv.Itoa(f.temp)
 }
 
 func (f *functionProjector) emitExpr(expr ast.Expr, kind, result, text string, depth int) {
 	span := f.projector.span(expr.Pos(), expr.End())
-	f.ops = append(f.ops, ir.Op{
-		ID:     f.projector.nodeID(expr, span),
-		Kind:   kind,
-		Result: result,
-		Text:   text,
-		Depth:  depth,
-		Source: span,
-	})
+	id := f.projector.nodeID(expr, span, kind, result)
+	f.ops = append(f.ops, ir.Op{ID: id, Kind: kind, Result: result, Text: text, Depth: depth, Source: span})
 }
 
-func (f *functionProjector) emitNode(node ast.Node, kind, result, text string, depth int) {
+func (f *functionProjector) emitPatchable(node ast.Node, kind, result, text string, depth int) {
 	span := f.projector.span(node.Pos(), node.End())
-	f.ops = append(f.ops, ir.Op{
-		ID:     f.projector.nodeID(node, span),
-		Kind:   kind,
-		Result: result,
-		Text:   text,
-		Depth:  depth,
-		Source: span,
-	})
+	id := f.projector.nodeID(node, span, kind, result)
+	f.ops = append(f.ops, ir.Op{ID: id, Kind: kind, Result: result, Text: text, Depth: depth, Source: span})
+}
+
+func (f *functionProjector) emitStructural(node ast.Node, kind, text string, depth int) {
+	span := f.projector.span(node.Pos(), node.End())
+	f.ops = append(f.ops, ir.Op{Kind: kind, Text: text, Depth: depth, Source: span})
 }

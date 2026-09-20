@@ -1,128 +1,124 @@
 # AgentIR
 
-**AgentIR is an experiment in giving coding agents a deterministic intermediate representation of source code while preserving human-written source as the source of truth.**
+**AgentIR is an experiment in giving coding agents a deterministic intermediate representation of source code while keeping human-written source as the only source of truth.**
 
-The working hypothesis is simple: compact source is often pleasant for humans but unnecessarily difficult for agents to search, reason about, and patch. AgentIR projects a selected source file into a more explicit operation stream, lets an agent address semantic nodes, and maps guarded edits back to the smallest original source spans.
+The hypothesis: compact/nested source is often good for humans but creates poor search and patch targets for coding agents. AgentIR projects a selected Go file into an ephemeral, more linear view, gives exact source fragments short node addresses, and can translate edits to that view back into minimal source changes.
 
-This repository starts with **Go** because its standard library provides a strong parser/AST/token toolchain and a deliberately small language surface. That lets the first experiments test the representation instead of parser engineering.
+Go is the first target because the standard parser/AST/token packages let the experiment focus on the representation rather than parser engineering.
 
-## Current experiment: v0
-
-The v0 prototype supports two operations:
-
-```text
-human Go source
-      |
-      v
-agentir project
-      |
-      v
-AgentIR projection (ephemeral view)
-      |
-      v
-structured patch {node_id -> replacement}
-      |
-      v
-agentir apply
-      |
-      v
-minimal source replacement
-```
-
-The original `.go` file is never replaced by a generated canonical copy. The projection is disposable and can always be regenerated.
-
-### Example
+## Example
 
 Human source:
 
 ```go
-users := filterUsers(loadUsers(ctx))
+result = append(result, strings.ToLower(strings.TrimSpace(user.Name)))
 ```
 
-AgentIR exposes the nested computation as explicit operations similar to:
+AgentIR:
 
 ```text
-$t1 = call loadUsers(ctx)
-$t2 = call filterUsers($t1)
-users := $t2
+n4 $2=strings.TrimSpace(user.Name)
+n5 $3=strings.ToLower($2)
+n6 result = append(result, $3)
 ```
 
-Every projected node gets a deterministic snapshot-local ID (for example `n7`) in projection order. IDs only need to be stable for that exact source snapshot because the projection also includes the source SHA-256. Patches must target known node IDs and the exact source hash they were generated from, so stale projections fail closed.
+Control flow stays visible but is deliberately not patch-addressable when a row does not correspond to one exact source fragment:
 
-## Try it
+```text
+if !user.Active
+ n3 continue
+```
+
+Only rows with an `nN` address are direct edit targets.
+
+## CLI
+
+Project Go source:
 
 ```bash
 go run ./cmd/agentir project ./fixtures/nested.go
 ```
 
-The default output is a compact, line-oriented agent view. It deliberately omits byte/line spans because the node ID is sufficient for patch targeting. JSON retains the full source map when a machine-readable projection is useful:
+Machine-readable projection with kinds and exact source spans:
 
 ```bash
 go run ./cmd/agentir project --format json ./fixtures/nested.go
 ```
 
-Build the CLI:
+### Edit AgentIR and project it back
 
-```bash
-go build ./cmd/agentir
-./agentir project ./fixtures/nested.go
-```
-
-A patch document has this shape:
+An IR patch edits the operation text rather than supplying the original Go span directly:
 
 ```json
 {
-  "version": "agentir/patch-v0",
-  "source_sha256": "<sha256 from projection>",
+  "version": "agentir/irpatch-v0",
+  "source_sha256": "<hash from project output>",
   "edits": [
     {
-      "node_id": "n7",
-      "replacement": "normalizeName(name)"
+      "node_id": "n5",
+      "text": "strings.ToUpper($2)"
     }
   ]
 }
 ```
 
-Preview the mapped edit without modifying the source:
+Preview:
 
 ```bash
-./agentir apply --patch patch.json ./example.go
+go run ./cmd/agentir apply-ir --patch patch.json ./fixtures/nested.go
 ```
 
-Write only when explicitly requested:
+Write explicitly:
 
 ```bash
-./agentir apply --patch patch.json --write ./example.go
+go run ./cmd/agentir apply-ir --patch patch.json --write ./fixtures/nested.go
 ```
 
-`apply` rejects stale hashes, missing node IDs, duplicate node IDs, overlapping edits, and edits that make the Go file syntactically invalid. It intentionally does **not** run `gofmt`; preserving untouched human formatting is part of the experiment.
+`$N` values are ephemeral AgentIR temporaries. During projection back to Go they expand to the exact source expression represented by that temporary. For example, `strings.ToUpper($2)` can become `strings.ToUpper((strings.TrimSpace(user.Name)))` without the agent needing to reproduce the nested source text.
 
-## What v0 is testing
+`apply` also exists as a lower-level baseline where the replacement payload is raw Go source. This lets experiments separate the value of node addressing from the value of editing the IR itself.
 
-The first benchmark should compare the same coding tasks under three modes:
+## Safety properties in v0
 
-1. raw source + text patching;
-2. raw source + AST-addressed patching;
-3. AgentIR projection + node-addressed patching.
+- Human source remains canonical; AgentIR is disposable.
+- Every projection is bound to the exact source SHA-256.
+- Node IDs are deterministic and local to that source snapshot.
+- Structural rows such as `if`, `for`, `switch`, and `select` are non-addressable when they span nested bodies.
+- Unknown, duplicate, stale, and overlapping edits fail closed.
+- Rewritten output must parse as Go before it is returned.
+- Untouched source is not globally reformatted.
 
-Useful measurements:
+## Representation density
 
-- task success and test pass rate;
-- compile/parse success;
-- retries and failed patches;
-- accidental/unrelated edits;
-- input/output tokens;
-- search/read/patch tool calls;
-- patch size and wall-clock time.
+Run the local density lab:
 
-The important question is not whether expanded code looks cleaner. It is whether an ephemeral agent-oriented representation produces **more reliable edits at acceptable token and latency cost**.
+```bash
+go run ./cmd/agentir-lab /usr/local/go/src
+```
 
-## Non-goals for v0
+On the Go 1.23.2 source tree in the development sandbox, excluding tests, `vendor`, and `testdata`:
 
-- replacing Go syntax with a new programming language;
-- making AgentIR the repository source of truth;
-- preserving a second generated codebase;
-- solving whole-repository symbol resolution;
-- supporting every Go AST node before measuring anything.
+- 3,480 files
+- 40,390 functions
+- 0 projection failures
+- 23,464,339 raw function bytes
+- 27,900,472 compact AgentIR bytes
+- **1.189x weighted byte expansion**
+- 1.141x median
+- 1.365x p90
+- 1.758x p99
+- 169 functions above 2x
 
-The next step after a useful Go result is likely TypeScript, where chained expressions, callbacks, JSX/TSX, and a larger syntax surface should stress the hypothesis much harder.
+This is a byte-size sanity check, **not a token benchmark** and not evidence that agents perform better. It already changed the design: folding the outermost expression into its containing statement reduced weighted expansion from roughly 1.37x to 1.19x while retaining explicit nested operations.
+
+## What still has to be proven
+
+The useful benchmark compares identical coding tasks under controlled modes:
+
+1. raw source + textual patching;
+2. raw source + AST/node-addressed raw-Go patching;
+3. AgentIR + AgentIR-addressed patching.
+
+Measure task/test success, retries, rejected patches, unrelated edits, context/output tokens, tool calls, patch size, and wall-clock time. If AgentIR does not improve reliability or cost after its representation overhead is included, the hypothesis fails.
+
+See [`docs/EXPERIMENTS.md`](docs/EXPERIMENTS.md) for the experiment protocol and current observations.

@@ -1,6 +1,7 @@
 package project
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -23,28 +24,96 @@ func run(ctx string) []int {
 		t.Fatalf("functions=%d, want 3", len(projection.Document.Functions))
 	}
 
-	var runOps []string
+	var got []string
 	for _, fn := range projection.Document.Functions {
 		if fn.Name != "run" {
 			continue
 		}
+		if fn.Signature != "run(ctx string) []int" {
+			t.Fatalf("signature=%q", fn.Signature)
+		}
 		for _, op := range fn.Ops {
-			runOps = append(runOps, op.Text)
+			if op.Result != "" {
+				got = append(got, op.Result+"="+op.Text)
+			} else {
+				got = append(got, op.Text)
+			}
 		}
 	}
 
 	want := []string{
-		"call load(ctx)",
-		"call filter($t1)",
-		"users := $t2",
+		"$1=load(ctx)",
+		"users := filter($1)",
 		"return users",
 	}
-	if len(runOps) != len(want) {
-		t.Fatalf("ops=%q, want %q", runOps, want)
+	if len(got) != len(want) {
+		t.Fatalf("ops=%q, want %q", got, want)
 	}
 	for i := range want {
-		if runOps[i] != want[i] {
-			t.Fatalf("op[%d]=%q, want %q", i, runOps[i], want[i])
+		if got[i] != want[i] {
+			t.Fatalf("op[%d]=%q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestStructuralControlRowsAreNotPatchable(t *testing.T) {
+	src := []byte(`package demo
+func f(x bool) int {
+	if !x {
+		return 1
+	}
+	return 2
+}
+`)
+	projection, err := Project("demo.go", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ops := projection.Document.Functions[0].Ops
+	var sawIf bool
+	for _, op := range ops {
+		if op.Kind == "if" {
+			sawIf = true
+			if op.ID != "" {
+				t.Fatalf("structural if unexpectedly addressable: %+v", op)
+			}
+		}
+	}
+	if !sawIf {
+		t.Fatal("missing if row")
+	}
+	for id, node := range projection.Nodes {
+		if node.Kind == "if" || id == "" {
+			t.Fatalf("invalid patch node %q: %+v", id, node)
+		}
+	}
+}
+
+func TestCommentsRemainVisible(t *testing.T) {
+	src := []byte(`package demo
+func f(x int) int {
+	// preserve semantic hint
+	if x > 0 {
+		// positive path
+		return x
+	}
+	return 0
+}
+`)
+	projection, err := Project("demo.go", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var text []string
+	for _, op := range projection.Document.Functions[0].Ops {
+		text = append(text, op.Text)
+	}
+	joined := strings.Join(text, "
+")
+	for _, want := range []string{"// preserve semantic hint", "// positive path"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %q in:
+%s", want, joined)
 		}
 	}
 }
@@ -60,19 +129,13 @@ func TestProjectDeterministic(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if a.Document.Source.SHA256 != b.Document.Source.SHA256 {
-		t.Fatal("source hashes differ")
-	}
-	if len(a.Document.Functions) != 1 || len(b.Document.Functions) != 1 {
-		t.Fatal("unexpected function count")
-	}
 	aOps := a.Document.Functions[0].Ops
 	bOps := b.Document.Functions[0].Ops
 	if len(aOps) != len(bOps) {
 		t.Fatal("operation counts differ")
 	}
 	for i := range aOps {
-		if aOps[i].ID != bOps[i].ID || aOps[i].Text != bOps[i].Text {
+		if aOps[i].ID != bOps[i].ID || aOps[i].Text != bOps[i].Text || aOps[i].Result != bOps[i].Result {
 			t.Fatalf("projection differs at op %d", i)
 		}
 	}

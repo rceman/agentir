@@ -8,7 +8,7 @@ import (
 	"github.com/rceman/agentir/internal/project"
 )
 
-func TestApplyReplacesExactExpressionAndPreservesSurroundingSource(t *testing.T) {
+func TestApplyReplacesExactStatementAndPreservesSurroundingSource(t *testing.T) {
 	src := []byte(`package demo
 
 func run(name string) string {
@@ -21,24 +21,24 @@ func run(name string) string {
 		t.Fatal(err)
 	}
 
-	var callID string
+	var returnID string
 	for _, fn := range projection.Document.Functions {
 		for _, op := range fn.Ops {
-			if op.Kind == "call" && strings.Contains(op.Text, "formatName") {
-				callID = op.ID
+			if op.Kind == "return" {
+				returnID = op.ID
 			}
 		}
 	}
-	if callID == "" {
-		t.Fatal("call node not found")
+	if returnID == "" {
+		t.Fatal("return node not found")
 	}
 
 	p := ir.Patch{
 		Version:      ir.PatchVersion,
 		SourceSHA256: projection.Document.Source.SHA256,
 		Edits: []ir.Edit{{
-			NodeID:      callID,
-			Replacement: "normalizeName(name)",
+			NodeID:      returnID,
+			Replacement: "return normalizeName(name)",
 		}},
 	}
 	out, err := Apply("demo.go", src, p)
@@ -56,10 +56,23 @@ func TestApplyRejectsStaleSource(t *testing.T) {
 	p := ir.Patch{
 		Version:      ir.PatchVersion,
 		SourceSHA256: "stale",
-		Edits:        []ir.Edit{{NodeID: "n_missing", Replacement: "2"}},
+		Edits:        []ir.Edit{{NodeID: "n999", Replacement: "2"}},
 	}
 	_, err := Apply("demo.go", src, p)
 	if err == nil || !strings.Contains(err.Error(), "source hash mismatch") {
 		t.Fatalf("error=%v, want source hash mismatch", err)
+	}
+}
+
+func TestApplyRejectsStructuralNode(t *testing.T) {
+	src := []byte("package demo\nfunc f(x bool) int { if x { return 1 }; return 0 }\n")
+	projection, err := project.Project("demo.go", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range projection.Document.Functions[0].Ops {
+		if op.Kind == "if" && op.ID != "" {
+			t.Fatalf("if should not have ID: %+v", op)
+		}
 	}
 }
