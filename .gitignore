@@ -1,0 +1,5 @@
+/agentir
+/agentir-lab
+*.out
+*.test
+.DS_Store
