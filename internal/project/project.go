@@ -189,8 +189,7 @@ func (f *functionProjector) emitCommentsBefore(limit token.Pos, depth int) {
 		if text == "" {
 			text = "//"
 		} else {
-			lines := strings.Split(text, "
-")
+			lines := strings.Split(text, "\n")
 			for i := range lines {
 				lines[i] = "// " + strings.TrimSpace(lines[i])
 			}

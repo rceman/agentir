@@ -108,12 +108,10 @@ func f(x int) int {
 	for _, op := range projection.Document.Functions[0].Ops {
 		text = append(text, op.Text)
 	}
-	joined := strings.Join(text, "
-")
+	joined := strings.Join(text, "\n")
 	for _, want := range []string{"// preserve semantic hint", "// positive path"} {
 		if !strings.Contains(joined, want) {
-			t.Fatalf("missing %q in:
-%s", want, joined)
+			t.Fatalf("missing %q in:\n%s", want, joined)
 		}
 	}
 }
